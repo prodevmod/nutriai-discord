@@ -1,12 +1,15 @@
 # ═══════════════════════════════════════════════════════════════════
-# NutriAI Discord Bot — v3
+# NutriAI Discord Bot — v4
 # ═══════════════════════════════════════════════════════════════════
-# v3 changes:
-#   • Rate limit handling — safe_send() and safe_edit() retry
-#     automatically when Discord returns 429
-#   • Global on_message try/except catches any uncaught 429s
-#   • All message.channel.send() and msg.edit() replaced with
-#     safe_send() / safe_edit() throughout
+# v4 changes:
+#   • 15s startup delay — prevents Render crash-restart loops from
+#     hammering Discord's login endpoint and triggering 429 blocks
+#   • Exponential backoff on login 429 — waits 15s, 30s, 60s before
+#     each retry instead of immediately crashing and restarting
+#
+# v3 features (kept):
+#   • safe_send() / safe_edit() retry automatically on 429
+#   • Global on_message try/except catches all uncaught 429s
 #
 # v2 features (kept):
 #   • Setup asks g/week rate for lose/gain goals
@@ -938,10 +941,56 @@ async def _handle_message(message, user_id, text, text_low):
 
 
 # ══ START ═════════════════════════════════════════════════════════════════════
+#
+# Why the sleep(15) is here:
+#   Render restarts the bot immediately when it crashes. If Discord's login
+#   endpoint is rate-limited (429), the bot crashes, Render restarts instantly,
+#   it tries to login again, gets 429 again, crashes again — infinite loop that
+#   extends the block indefinitely. The 15s delay breaks that loop by giving
+#   Discord's rate limit time to expire before each login attempt.
+#
+# Why the retry loop is here:
+#   On first deploy or after a long gap, Discord sometimes returns 429 on
+#   the very first login. Instead of crashing and letting Render restart
+#   immediately, we catch it here and wait progressively longer (15s, 30s,
+#   60s) before retrying — exponential backoff.
+
+import time
+
 if __name__ == "__main__":
     if not TOKEN:
         print("ERROR: DISCORD_BOT_TOKEN not found in .env")
+        print("Add DISCORD_BOT_TOKEN to your .env file or Render environment variables.")
         exit(1)
+
     init_db()
-    print("🥗 Starting NutriAI Discord Bot v3...")
-    client.run(TOKEN)
+
+    # Startup delay — prevents crash-restart loop from hammering Discord
+    print("⏳ Waiting 15s before connecting (prevents rate limit loops)...")
+    time.sleep(15)
+
+    # Retry loop with exponential backoff for login 429s
+    MAX_RETRIES   = 5
+    retry_delays  = [15, 30, 60, 120, 300]   # seconds between retries
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            print(f"🥗 Starting NutriAI Discord Bot v4... (attempt {attempt + 1}/{MAX_RETRIES})")
+            client.run(TOKEN)
+            break   # clean exit — don't retry
+        except discord.errors.HTTPException as e:
+            if e.status == 429:
+                if attempt < MAX_RETRIES - 1:
+                    wait = retry_delays[attempt]
+                    print(f"⏳ Discord login rate limited (429) — waiting {wait}s before retry...")
+                    time.sleep(wait)
+                else:
+                    print("❌ Max retries reached. Discord is still rate limiting this IP.")
+                    print("   Wait 10-15 minutes then manually redeploy on Render.")
+                    exit(1)
+            else:
+                print(f"❌ Discord HTTP error on login: {e}")
+                exit(1)
+        except Exception as e:
+            print(f"❌ Unexpected error on startup: {e}")
+            exit(1)
